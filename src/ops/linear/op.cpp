@@ -4,9 +4,62 @@
 #include "../../utils.hpp"
 
 #include <algorithm> // std::min
+#include <thread>    // std::thread（按输出列并行）
 #include <vector>    // std::vector（float 解码缓冲区）
 
 namespace llaisys::ops {
+
+namespace {
+
+// 把 count 个元素从 src（dtype 指定的类型）解码成 float 写入 dst。
+void decode_to_f32(float *dst, const std::byte *src, llaisysDataType_t dtype, size_t count) {
+    switch (dtype) {
+    case LLAISYS_DTYPE_F32: {
+        const float *p = reinterpret_cast<const float *>(src);
+        for (size_t i = 0; i < count; ++i) {
+            dst[i] = p[i];
+        }
+        return;
+    }
+    case LLAISYS_DTYPE_BF16: {
+        const bf16_t *p = reinterpret_cast<const bf16_t *>(src);
+        for (size_t i = 0; i < count; ++i) {
+            dst[i] = utils::cast<float>(p[i]);
+        }
+        return;
+    }
+    case LLAISYS_DTYPE_F16: {
+        const fp16_t *p = reinterpret_cast<const fp16_t *>(src);
+        for (size_t i = 0; i < count; ++i) {
+            dst[i] = utils::cast<float>(p[i]);
+        }
+        return;
+    }
+    default:
+        EXCEPTION_UNSUPPORTED_DATATYPE(dtype);
+    }
+}
+
+// 长度为 k 的点积。
+// 用 4 个独立累加器：浮点加法不满足结合律，编译器在没有 /fp:fast 时不能自行拆分归约链，
+// 手动拆成 4 条独立依赖链可让 CPU 流水线并行执行乘加，明显快于单累加器版本。
+float dot_f32(const float *a, const float *b, size_t k) {
+    float s0 = 0.f, s1 = 0.f, s2 = 0.f, s3 = 0.f;
+    size_t p = 0;
+    for (; p + 4 <= k; p += 4) {
+        s0 += a[p + 0] * b[p + 0];
+        s1 += a[p + 1] * b[p + 1];
+        s2 += a[p + 2] * b[p + 2];
+        s3 += a[p + 3] * b[p + 3];
+    }
+    float sum = (s0 + s1) + (s2 + s3);
+    for (; p < k; ++p) {
+        sum += a[p] * b[p];
+    }
+    return sum;
+}
+
+} // namespace
 
 // 计算 Y = X * W^T + b
 //   out    : [m, n]，输出 Y，2D 连续张量
@@ -64,78 +117,19 @@ void linear(tensor_t out, tensor_t in, tensor_t weight, tensor_t bias) {
     }
 
     // ---- 以下是 CPU 实现 ----
-    // 第 1 步：把输入、权重、偏置统一整理成 float 数组。
+    // 第 1 步：把输入与偏置解码成 float。这两块都很小（m*k 与 n），一次性解码即可。
     //
-    // 这一步不只是为了统一代码路径，更是性能上的关键：f16/bf16 的解码函数
-    // （_f16_to_f32 / _bf16_to_f32）定义在另一个编译单元 src/utils/types.cpp 中，
-    // 而本项目没有开启 LTO/LTCG，所以它们无法被内联。如果放在矩阵乘的最内层循环里调用，
-    // 大测例会产生 86 亿次跨模块函数调用，慢到无法接受。
-    // 先一次性解码（只需 m*k + n*k 次调用），之后的乘加就全部在纯 float 上进行。
-    //
-    // f32 时数据本身就是 float，直接借用原指针，零拷贝、零转换开销。
-    std::vector<float> in_buf, w_buf, bias_buf;
-    const float *in_f = nullptr;
-    const float *w_f = nullptr;
-    const float *bias_f = nullptr;
+    // 权重故意不在这里整体解码。weight 是全模型最大的张量（lm_head 为 151936x1536），
+    // 整体解码需要 n*k 个 float，约 933MB，每次调用都分配一次，推理时完全不可用。
+    // 改为在下面按行解码：每行只需 k 个 float 的临时缓冲区，且该行会被 m 行输入复用。
+    // f16/bf16 的解码函数现在内联在 types.hpp 中，所以按元素调用不再有跨模块调用开销。
+    std::vector<float> in_f(m * k);
+    decode_to_f32(in_f.data(), in->data(), in->dtype(), m * k);
 
-    switch (out->dtype()) {
-    case LLAISYS_DTYPE_F32: {
-        // 直接复用三块原始内存。
-        in_f = reinterpret_cast<const float *>(in->data());
-        w_f = reinterpret_cast<const float *>(weight->data());
-        if (has_bias) {
-            bias_f = reinterpret_cast<const float *>(bias->data());
-        }
-        break;
-    }
-    case LLAISYS_DTYPE_BF16: {
-        const bf16_t *ip = reinterpret_cast<const bf16_t *>(in->data());
-        const bf16_t *wp = reinterpret_cast<const bf16_t *>(weight->data());
-        in_buf.resize(m * k);
-        w_buf.resize(n * k);
-        for (size_t i = 0; i < m * k; ++i) {
-            in_buf[i] = utils::cast<float>(ip[i]); // bf16 -> float
-        }
-        for (size_t i = 0; i < n * k; ++i) {
-            w_buf[i] = utils::cast<float>(wp[i]);
-        }
-        in_f = in_buf.data();
-        w_f = w_buf.data();
-        if (has_bias) {
-            const bf16_t *bp = reinterpret_cast<const bf16_t *>(bias->data());
-            bias_buf.resize(n);
-            for (size_t j = 0; j < n; ++j) {
-                bias_buf[j] = utils::cast<float>(bp[j]);
-            }
-            bias_f = bias_buf.data();
-        }
-        break;
-    }
-    case LLAISYS_DTYPE_F16: {
-        const fp16_t *ip = reinterpret_cast<const fp16_t *>(in->data());
-        const fp16_t *wp = reinterpret_cast<const fp16_t *>(weight->data());
-        in_buf.resize(m * k);
-        w_buf.resize(n * k);
-        for (size_t i = 0; i < m * k; ++i) {
-            in_buf[i] = utils::cast<float>(ip[i]); // fp16 -> float
-        }
-        for (size_t i = 0; i < n * k; ++i) {
-            w_buf[i] = utils::cast<float>(wp[i]);
-        }
-        in_f = in_buf.data();
-        w_f = w_buf.data();
-        if (has_bias) {
-            const fp16_t *bp = reinterpret_cast<const fp16_t *>(bias->data());
-            bias_buf.resize(n);
-            for (size_t j = 0; j < n; ++j) {
-                bias_buf[j] = utils::cast<float>(bp[j]);
-            }
-            bias_f = bias_buf.data();
-        }
-        break;
-    }
-    default:
-        EXCEPTION_UNSUPPORTED_DATATYPE(out->dtype());
+    std::vector<float> bias_f;
+    if (has_bias) {
+        bias_f.resize(n);
+        decode_to_f32(bias_f.data(), bias->data(), bias->dtype(), n);
     }
 
     // 结果先存放在 float 缓冲区中，最后统一转换回原始数据类型。
@@ -146,43 +140,50 @@ void linear(tensor_t out, tensor_t in, tensor_t weight, tensor_t bias) {
     // 数学式 Y = X * W^T 中的转置，靠“按行读取 weight”隐式完成：
     // W^T 的第 j 列就是 W 的第 j 行，所以 out[i][j] 等于 in 第 i 行与 weight 第 j 行的点积。
     // 这样两个操作数在内存上都是连续的，缓存友好，也不需要真的搬运数据做转置。
-    //
-    // 分块大小：一次处理 IB 行输入。作用是提升 weight 的缓存复用率——内层对同一行 weight
-    //（k 个 float）连续做 IB 次点积，该行只需从内存读入一次，就被 IB 行输入共用。
-    // 于是 weight 的总内存流量从 m*n*k 降到 (m/IB)*n*k，在 512x4096x4096 这组用例上
-    // 约由 34GB 降到 4GB，避免整个算子退化成受内存带宽限制。
-    constexpr size_t IB = 8;
+    const std::byte *w_base = weight->data();
+    const size_t w_elem_size = weight->elementSize();
+    const llaisysDataType_t w_dtype = weight->dtype();
 
-    for (size_t i0 = 0; i0 < m; i0 += IB) {        // 遍历输入行的分块
-        const size_t i_end = std::min(i0 + IB, m); // 本块的结束行（尾块可能不足 IB 行）
-        for (size_t j = 0; j < n; ++j) {           // 遍历输出列，即 weight 的行
-            const float *w_row = w_f + j * k;      // weight 第 j 行的首地址，长度 k
-            for (size_t i = i0; i < i_end; ++i) {  // 本块内的每一行输入
-                const float *in_row = in_f + i * k; // in 第 i 行的首地址，长度 k
-
-                // 用 4 个独立累加器做点积。
-                // 浮点加法不满足结合律，编译器在没有 /fp:fast 时不能自行拆分归约链；
-                // 手动拆成 4 条独立的依赖链，可以让 CPU 流水线并行执行乘加，
-                // 明显快于单累加器版本。数值上等价于一种固定的分组求和顺序，
-                // 精度不低于（通常略优于）朴素顺序累加。
-                float s0 = 0.f, s1 = 0.f, s2 = 0.f, s3 = 0.f;
-                size_t p = 0;
-                for (; p + 4 <= k; p += 4) { // 主循环：每次消耗 4 个元素
-                    s0 += in_row[p + 0] * w_row[p + 0];
-                    s1 += in_row[p + 1] * w_row[p + 1];
-                    s2 += in_row[p + 2] * w_row[p + 2];
-                    s3 += in_row[p + 3] * w_row[p + 3];
-                }
-                float sum = (s0 + s1) + (s2 + s3); // 合并 4 条累加链
-                for (; p < k; ++p) {               // 处理 k 不是 4 的倍数时剩下的尾部
-                    sum += in_row[p] * w_row[p];
-                }
-
-                if (bias_f != nullptr) { // 不提供偏置时为空指针，跳过累加
-                    sum += bias_f[j];    // 偏置按输出列索引取，广播到所有行
+    // 每个线程负责一段连续的输出列 [j_begin, j_end)。不同 j 写入的是 out_f 中不同的位置，
+    // 线程之间没有重叠，也没有共享的可变状态；每个输出元素的累加顺序与串行版本完全一致，
+    // 因此多线程不改变计算结果。
+    auto compute_cols = [&](size_t j_begin, size_t j_end) {
+        std::vector<float> w_row(k); // 当前 weight 行的解码缓冲区，线程私有
+        for (size_t j = j_begin; j < j_end; ++j) {
+            decode_to_f32(w_row.data(), w_base + j * k * w_elem_size, w_dtype, k);
+            for (size_t i = 0; i < m; ++i) {
+                float sum = dot_f32(in_f.data() + i * k, w_row.data(), k);
+                if (has_bias) {      // 不提供偏置时跳过累加
+                    sum += bias_f[j]; // 偏置按输出列索引取，广播到所有行
                 }
                 out_f[i * n + j] = sum;
             }
+        }
+    };
+
+    // 线程数按可用核数与工作量决定；小规模时直接串行，避免线程开销反而变慢。
+    size_t nthread = 1;
+    if (m * n * k >= (size_t(1) << 20)) {
+        const unsigned hw = std::thread::hardware_concurrency();
+        nthread = std::min<size_t>(hw == 0 ? 1 : hw, n);
+    }
+
+    if (nthread <= 1) {
+        compute_cols(0, n);
+    } else {
+        std::vector<std::thread> pool;
+        pool.reserve(nthread - 1);
+        const size_t chunk = (n + nthread - 1) / nthread;
+        for (size_t t = 1; t < nthread; ++t) {
+            const size_t j_begin = std::min(t * chunk, n);
+            const size_t j_end = std::min(j_begin + chunk, n);
+            if (j_begin < j_end) {
+                pool.emplace_back(compute_cols, j_begin, j_end);
+            }
+        }
+        compute_cols(0, std::min(chunk, n)); // 主线程也承担一份
+        for (auto &th : pool) {
+            th.join();
         }
     }
 
